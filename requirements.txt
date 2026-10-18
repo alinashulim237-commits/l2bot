@@ -1,0 +1,7 @@
+mss
+opencv-python
+numpy
+pydirectinput
+keyboard
+pyyaml
+requests
