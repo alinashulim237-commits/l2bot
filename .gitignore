@@ -17,3 +17,5 @@ passive_*.png
 win_info.txt
 max_info.txt
 all_windows.txt
+calibration.yaml
+debug_*.png

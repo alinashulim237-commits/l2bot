@@ -27,11 +27,13 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 import cv2
 import keyboard
+import math
 import mss
 import numpy as np
 import pydirectinput
 import yaml
 
+import mobfinder
 from notifier import Notifier
 
 # Чтобы консоль Windows (cp1251) не падала на эмодзи и спецсимволах
@@ -183,22 +185,47 @@ def is_game_window_foreground() -> bool:
 
 
 def focus_game_window(wait_render: float = 0.25) -> int | None:
-    """Находит окно KetraWars / Lineage 2 и надёжно выводит его на передний план."""
+    """Находит окно KetraWars / Lineage 2 и надёжно выводит его на передний план с обходом Windows Foreground Lock."""
     user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
     found_hwnd = find_game_window()
     if found_hwnd:
         try:
             fg = user32.GetForegroundWindow()
             if fg != found_hwnd:
                 minimize_console()
-                if user32.IsIconic(found_hwnd):
-                    user32.ShowWindow(found_hwnd, 9)  # SW_RESTORE
-                    time.sleep(0.5)
+                fg_tid = user32.GetWindowThreadProcessId(fg, None) if fg else 0
+                cur_tid = kernel32.GetCurrentThreadId()
+                target_tid = user32.GetWindowThreadProcessId(found_hwnd, None)
+
+                if target_tid:
+                    user32.AttachThreadInput(cur_tid, target_tid, True)
+                if fg_tid and fg_tid != cur_tid:
+                    user32.AttachThreadInput(cur_tid, fg_tid, True)
+
+                try:
+                    user32.AllowSetForegroundWindow(0xFFFF)
+                except Exception:
+                    pass
+
                 user32.keybd_event(0x12, 0, 0, 0)
                 user32.keybd_event(0x12, 0, 2, 0)
-                user32.SwitchToThisWindow(found_hwnd, True)
-                user32.SetForegroundWindow(found_hwnd)
+
+                if user32.IsIconic(found_hwnd):
+                    user32.ShowWindow(found_hwnd, 9)  # SW_RESTORE
+                    time.sleep(0.3)
+                else:
+                    user32.ShowWindow(found_hwnd, 5)  # SW_SHOW
+
                 user32.BringWindowToTop(found_hwnd)
+                user32.SetForegroundWindow(found_hwnd)
+                user32.SetActiveWindow(found_hwnd)
+
+                if fg_tid and fg_tid != cur_tid:
+                    user32.AttachThreadInput(cur_tid, fg_tid, False)
+                if target_tid:
+                    user32.AttachThreadInput(cur_tid, target_tid, False)
+
                 time.sleep(wait_render)
         except Exception:
             pass
@@ -338,9 +365,19 @@ def _deep_merge(base: dict, override: dict) -> dict:
     return result
 
 
-def load_config(path="config.yaml", secrets_path="secrets.yaml"):
+def load_config(path="config.yaml", secrets_path="secrets.yaml", calibration_path="calibration.yaml"):
     with open(path, encoding="utf-8") as f:
         cfg = yaml.safe_load(f) or {}
+
+    # Локальные результаты калибровки (python calibrate.py mob) — лежат отдельно, config.yaml не трогают
+    if calibration_path and os.path.exists(calibration_path):
+        try:
+            with open(calibration_path, encoding="utf-8") as cf:
+                cal = yaml.safe_load(cf) or {}
+            if isinstance(cal, dict):
+                cfg = _deep_merge(cfg, cal)
+        except Exception as exc:
+            log(f"⚠ Не удалось прочитать {calibration_path}: {exc}")
 
     if secrets_path and os.path.exists(secrets_path):
         try:
@@ -381,7 +418,10 @@ def bar_percent(img_bgr, ranges, min_fill=0.5):
 
 
 class Vision:
+    BAR_PAD = 6   # запас вокруг полосы HP (px), чтобы небольшой сдвиг не ломал чтение
+
     def __init__(self, cfg):
+        self.cfg = cfg
         b = cfg.get("target_bar", {"x": 571, "y": 66, "w": 146, "h": 3})
         self.region = {"left": b["x"], "top": b["y"], "width": b["w"], "height": b["h"]}
         self.ranges = cfg["bar_color"]
@@ -415,6 +455,26 @@ class Vision:
                 return int(pt.x), int(pt.y)
         return 0, 0
 
+    def get_client_rect(self) -> tuple[int, int, int, int]:
+        """Клиентская область окна игры в экранных координатах: (left, top, width, height).
+        Если окно не найдено — весь основной монитор."""
+        user32 = ctypes.windll.user32
+        virt = self.sct.monitors[0]   # весь виртуальный рабочий стол
+        hwnd = find_game_window()
+        if hwnd:
+            rc = wt.RECT()
+            pt = wt.POINT(0, 0)
+            if user32.GetClientRect(hwnd, ctypes.byref(rc)) and user32.ClientToScreen(hwnd, ctypes.byref(pt)):
+                l, t, w, h = int(pt.x), int(pt.y), int(rc.right - rc.left), int(rc.bottom - rc.top)
+                # обрезаем по границам экрана
+                l2, t2 = max(l, virt["left"]), max(t, virt["top"])
+                r2 = min(l + w, virt["left"] + virt["width"])
+                b2 = min(t + h, virt["top"] + virt["height"])
+                if r2 - l2 >= 640 and b2 - t2 >= 480:
+                    return l2, t2, r2 - l2, b2 - t2
+        mon = self.sct.monitors[1]
+        return int(mon["left"]), int(mon["top"]), int(mon["width"]), int(mon["height"])
+
     def _grab(self, region: dict):
         try:
             raw = self.sct.grab(region)
@@ -430,15 +490,26 @@ class Vision:
         img = np.array(raw)[:, :, :3]  # BGRA -> BGR
         return np.ascontiguousarray(img)
 
-    def grab(self):
+    def _bar_region(self, region: dict) -> dict:
+        """Область полосы из config.yaml (смещение от клиентской области окна) -> экранные координаты с запасом."""
         ox, oy = self.get_origin()
-        return self._grab({"left": max(0, ox + 565), "top": max(0, oy + 58), "width": 150, "height": 14})
+        p = self.BAR_PAD
+        return {
+            "left": max(0, ox + region["left"] - p),
+            "top": max(0, oy + region["top"] - p),
+            "width": region["width"] + 2 * p,
+            "height": region["height"] + 2 * p,
+        }
+
+    def grab(self):
+        """Область полосы HP цели (берётся из target_bar в config.yaml)."""
+        return self._grab(self._bar_region(self.region))
 
     def grab_player(self):
-        ox, oy = self.get_origin()
-        return self._grab({"left": max(0, ox + 14), "top": max(0, oy + 46), "width": 152, "height": 12})
+        """Область полосы HP персонажа (берётся из player_bar в config.yaml)."""
+        return self._grab(self._bar_region(self.player_region))
 
-    def _band_hp(self, img_bgr, ranges, min_px: int = 2) -> float:
+    def _band_hp(self, img_bgr, ranges, min_px: int = 2, trim: int = 0) -> float:
         if img_bgr is None or img_bgr.size == 0:
             return 0.0
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -446,66 +517,41 @@ class Vision:
         for lo, hi in ranges:
             mask |= cv2.inRange(hsv, np.array(lo, np.uint8), np.array(hi, np.uint8))
         filled = (mask > 0).sum(axis=0) >= min_px
+        if trim and len(filled) > 2 * trim:
+            filled = filled[trim:len(filled) - trim]   # процент считаем по самой полосе, без запаса
         return float(filled.mean() * 100)
 
     def target_hp(self) -> float:
-        """Процент полосы HP цели (0..100). Захватывает динамическую область цели."""
-        img = self.grab()
-        return self._band_hp(img, self.ranges, min_px=2)
+        """Процент полосы HP цели (0..100)."""
+        return self._band_hp(self.grab(), self.ranges, min_px=2, trim=self.BAR_PAD)
 
     def player_hp(self) -> float:
-        """Процент полосы HP персонажа (0..100). Динамически привязан к ClientToScreen."""
-        img = self.grab_player()
-        return self._band_hp(img, self.player_ranges, min_px=2)
+        """Процент полосы HP персонажа (0..100)."""
+        return self._band_hp(self.grab_player(), self.player_ranges, min_px=2, trim=self.BAR_PAD)
+
+    def find_mobs_info(self):
+        """
+        Снимает клиентскую область окна игры и ищет мобов по цветным надписям 'Lvl:XX' (см. mobfinder.py).
+        Возвращает (картинка, [ {"x","y","box","pixels","sx","sy"} ]), где sx/sy — ЭКРАННЫЕ координаты клика.
+        """
+        l, t, w, h = self.get_client_rect()
+        img = self._grab({"left": l, "top": t, "width": w, "height": h})
+        mobs = mobfinder.find_mobs(img, self.cfg)
+        for m in mobs:
+            m["sx"], m["sy"] = l + m["x"], t + m["y"]
+        return img, mobs
 
     def find_mobs(self) -> list[tuple[int, int]]:
-        """
-        Ищет мобов на экране по цветным надписям 'Lvl:XX' над головой моба:
-        - Агрессивные мобы (Varka / Ketra / Bandersnatch): кораллово-розовый цвет [122, 120, 227]
-        Возвращает координаты (click_x, click_y) центра надписи имени моба,
-        отсортированные по расстоянию от центра экрана (ближайшие первыми).
-        Опасные сундуки (Treasure Chest) полностью исключаются!
-        """
-        monitor = self.sct.monitors[1]
-        img = self._grab(monitor)
-        h, w = img.shape[:2]
+        """Экранные координаты клика по именам мобов, ближайшие к центру первыми."""
+        _, mobs = self.find_mobs_info()
+        return [(m["sx"], m["sy"]) for m in mobs]
 
-        ox, oy = self.get_origin()
-
-        # Агрессивные мобы (кораллово-розовый BGR [122, 120, 227])
-        m_aggro = cv2.inRange(img, np.array([110, 108, 212], np.uint8), np.array([135, 135, 240], np.uint8))
-        mask = m_aggro.copy()
-
-        # Исключаем области интерфейса относительно окна игры
-        mask[:oy + 160, :ox + 520] = 0           # Статус игрока и баффы
-        mask[:oy + 130, ox + 540:ox + 760] = 0    # Полоса цели
-        mask[:oy + 130, ox + 1040:ox + 1180] = 0  # Иконка CP эликсира
-        mask[:oy + 210, ox + 1740:] = 0          # Радар
-        mask[oy + 600:, :ox + 880] = 0           # Чат и нижний скиллбар
-        mask[oy + 850:, :] = 0                  # Нижние панели
-
-        # Исключаем ник самого персонажа в центре экрана
-        cx, cy = w // 2, h // 2
-        mask[cy - 120:cy + 40, cx - 80:cx + 80] = 0
-
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (18, 5))
-        closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        cands = []
-        for cnt in contours:
-            bx, by, bw, bh = cv2.boundingRect(cnt)
-            ar = bw / max(1, bh)
-            # Проверяем размеры тега уровня моба (горизонтальная полоска текста Lvl:XX)
-            if 38 <= bw <= 130 and 7 <= bh <= 18 and ar >= 3.0:
-                mx = bx + bw // 2
-                # Кликаем прямо по центру белой надписи имени моба (на 12-14px ниже Lvl:XX)
-                my = min(h - 50, by + bh + 12)
-                dist = (mx - cx) ** 2 + (my - cy) ** 2
-                cands.append((dist, mx, my))
-
-        cands.sort()
-        return [(mx, my) for _, mx, my in cands]
+    def mob_debug_jpeg(self, img, mobs) -> bytes:
+        """Сохраняет debug_mobs.png (с разметкой) и возвращает JPEG для Telegram."""
+        dbg = mobfinder.draw_debug(img, self.cfg, mobs)
+        cv2.imwrite("debug_mobs.png", dbg)
+        ok, buf = cv2.imencode(".jpg", dbg, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+        return buf.tobytes() if ok else b""
 
     def screenshot_jpeg(self, quality: int = 80) -> bytes:
         """Скриншот ВСЕГО основного монитора в JPEG. Вызывать ТОЛЬКО из главного потока (ограничение mss)."""
@@ -668,6 +714,11 @@ class Bot:
         self.deaths = 0
         self.started = time.time()
 
+        # Точки экрана, по которым клик не взял моба в цель (временный чёрный список)
+        self._blacklist: list[tuple[float, float, float]] = []
+        self._last_mob_debug = -1e9
+        self._last_mob_tg = -1e9
+
         # Точки быстрой калибровки F5-F8
         self._cal_pts: dict[str, tuple[int, int] | None] = {
             "target_left": None,
@@ -687,6 +738,7 @@ class Bot:
             new_cfg = load_config()
             self.cfg = new_cfg
             self.empty = new_cfg.get("empty_threshold", 1.0)
+            self.vision.cfg = new_cfg
 
             b = new_cfg["target_bar"]
             self.vision.region = {"left": b["x"], "top": b["y"], "width": b["w"], "height": b["h"]}
@@ -891,9 +943,10 @@ class Bot:
                 if not p1 or not p2:
                     log("⚠ Сначала нажми F5 на левом краю полосы цели!")
                 else:
-                    x = min(p1[0], p2[0])
+                    ox, oy = self.vision.get_origin()   # в конфиг пишем смещение от клиентской области окна
+                    x = max(0, min(p1[0], p2[0]) - ox)
                     w = max(10, abs(p2[0] - p1[0]))
-                    y = max(0, int((p1[1] + p2[1]) / 2) - 1)
+                    y = max(0, int((p1[1] + p2[1]) / 2) - 1 - oy)
                     _update_yaml_bar("target_bar", x, y, w, 3)
                     self.reload_config()
                     cv2.imwrite("roi_debug.png", cv2.resize(self.vision.grab(), None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST))
@@ -911,9 +964,10 @@ class Bot:
                 if not p1 or not p2:
                     log("⚠ Сначала нажми F7 на левом краю своей полосы HP!")
                 else:
-                    x = min(p1[0], p2[0])
+                    ox, oy = self.vision.get_origin()
+                    x = max(0, min(p1[0], p2[0]) - ox)
                     w = max(10, abs(p2[0] - p1[0]))
-                    y = max(0, int((p1[1] + p2[1]) / 2))
+                    y = max(0, int((p1[1] + p2[1]) / 2) - oy)
                     _update_yaml_bar("player_bar", x, y, w, 2)
                     self.reload_config()
                     cv2.imwrite("roi_player_debug.png", cv2.resize(self.vision.grab_player(), None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST))
@@ -970,7 +1024,7 @@ class Bot:
     def press(self, key):
         hwnd = focus_game_window()
         l2_key_down(key, hwnd)
-        time.sleep(random.uniform(0.05, 0.10))
+        time.sleep(random.uniform(0.12, 0.16))
         l2_key_up(key, hwnd)
 
     def hold(self, key, sec):
@@ -999,73 +1053,142 @@ class Bot:
 
     def click_screen(self, x: int, y: int) -> None:
         """
-        Наводит курсор мыши на (x, y) и надёжно кликает левой кнопкой мыши.
-        Использует все методы ввода (SetCursorPos + pydirectinput + mouse_event + PostMessageW).
+        Наводит курсор на (x, y) и кликает левой кнопкой мыши.
+        Для надёжности в клиенте KetraWars / Interlude клик синхронизирован
+        (SendInput + mouse_event + PostMessageW) и удерживается 100-140 мс.
         """
         hwnd = focus_game_window()
         user32 = ctypes.windll.user32
-        user32.SetCursorPos(int(x), int(y))
-        time.sleep(0.06)
+        x, y = int(x), int(y)
+        method = str((self.cfg.get("input") or {}).get("click_method", "legacy")).lower()
 
-        # 1. pydirectinput (DirectInput / SendInput)
-        try:
-            pydirectinput.click(int(x), int(y))
-        except Exception:
-            pass
+        user32.SetCursorPos(x, y)
+        time.sleep(0.04)
+        for dx in (1, -1):
+            user32.mouse_event(0x0001, dx, 0, 0, 0)   # MOUSEEVENTF_MOVE
+            time.sleep(0.02)
+        user32.SetCursorPos(x, y)
+        time.sleep(0.05)
 
-        # 2. mouse_event (для GetKeyState и directinput)
-        try:
-            user32.mouse_event(0x0002, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTDOWN
-            time.sleep(0.04)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)  # MOUSEEVENTF_LEFTUP
-        except Exception:
-            pass
-
-        # 3. PostMessageW прямо в очередь окна игры (гарантированная регистрация)
-        if hwnd:
+        if method == "pydirectinput":
             try:
-                pt = wt.POINT(int(x), int(y))
+                pydirectinput.click(x, y)
+            except Exception as exc:
+                log(f"⚠ pydirectinput.click не сработал: {exc}")
+        elif method == "mouse_event":
+            user32.mouse_event(0x0002, 0, 0, 0, 0)    # LEFTDOWN
+            time.sleep(random.uniform(0.10, 0.14))
+            user32.mouse_event(0x0004, 0, 0, 0, 0)    # LEFTUP
+        else:
+            # legacy: синхронный клик по всем слоям ввода сразу с удержанием 120 мс
+            try:
+                pydirectinput.mouseDown(x, y)
+            except Exception:
+                pass
+            user32.mouse_event(0x0002, 0, 0, 0, 0)    # LEFTDOWN
+            if hwnd:
+                pt = wt.POINT(x, y)
                 user32.ScreenToClient(hwnd, ctypes.byref(pt))
                 lparam = ((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)
                 user32.PostMessageW(hwnd, 0x0201, 1, lparam)  # WM_LBUTTONDOWN
-                time.sleep(0.04)
-                user32.PostMessageW(hwnd, 0x0202, 0, lparam)  # WM_LBUTTONUP
+
+            time.sleep(random.uniform(0.10, 0.14))
+
+            try:
+                pydirectinput.mouseUp(x, y)
             except Exception:
                 pass
+            user32.mouse_event(0x0004, 0, 0, 0, 0)    # LEFTUP
+            if hwnd:
+                pt = wt.POINT(x, y)
+                user32.ScreenToClient(hwnd, ctypes.byref(pt))
+                lparam = ((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)
+                user32.PostMessageW(hwnd, 0x0202, 0, lparam)  # WM_LBUTTONUP
+
+    # ---- чёрный список точек, куда клик не сработал
+    def _is_blacklisted(self, x: float, y: float) -> bool:
+        now = time.time()
+        self._blacklist = [b for b in self._blacklist if b[2] > now]
+        r = float((self.cfg.get("mobs") or {}).get("blacklist_radius", 45))
+        return any(math.hypot(x - bx, y - by) < r for bx, by, _ in self._blacklist)
+
+    def _blacklist_add(self, x: float, y: float) -> None:
+        sec = float((self.cfg.get("mobs") or {}).get("blacklist_sec", 8))
+        self._blacklist.append((x, y, time.time() + sec))
+
+    def _report_no_mobs(self, img) -> None:
+        """Мобов не видно: сохраняем debug_mobs.png (и раз в 5 минут шлём в Telegram), чтобы понять почему."""
+        now = time.monotonic()
+        if now - self._last_mob_debug < 20:
+            return
+        self._last_mob_debug = now
+        try:
+            jpeg = self.vision.mob_debug_jpeg(img, [])
+            log("📷 Мобы на экране не найдены — разметка сохранена в debug_mobs.png "
+                "(жёлтое = совпало по цвету). Проверь: python bot.py --diagnose")
+            mcfg = self.cfg.get("mobs") or {}
+            if mcfg.get("debug_telegram", True) and jpeg and now - self._last_mob_tg > 300:
+                self._last_mob_tg = now
+                self.notifier.send_photo(jpeg, caption="🔍 Бот не видит мобов. Жёлтое = совпало по цвету, "
+                                                       "зелёное = принято как моб.", with_keyboard=False)
+        except Exception as exc:
+            log(f"⚠ Не удалось сохранить debug_mobs.png: {exc}")
 
     # ---- действия
     def select_target(self) -> bool:
         """
-        Выбирает моба и начинает атаку:
+        Выбирает моба и начинает атаку (порядок как в задании):
         1. Если моб уже в таргете — сразу атакуем.
-        2. Пробуем F1 (NextTarget).
-        3. Ищем мобов на экране: наводим мышь, кликаем ЛКМ и СРАЗУ прожимаем F2.
+        2. (опционально, keys.use_next_target) жмём клавишу «следующая цель».
+        3. Ищем мобов на экране по надписи Lvl:XX -> наводим курсор -> ЛКМ -> F2.
+        4. Ждём, пока в верхней полосе появится HP цели.
         """
+        keys = self.cfg.get("keys") or {}
+        timing = self.cfg.get("timing") or {}
+        mcfg = self.cfg.get("mobs") or {}
+        attack = str(keys.get("attack", "f2"))
+
         # Если цель уже есть
         if self.vision.target_hp() > self.empty:
             return True
 
-        # Пробуем NextTarget (F1)
-        self.press("f1")
-        time.sleep(0.12)
-        if self.vision.target_hp() > self.empty:
-            self.press("f2")
-            return True
+        # «Следующая цель» — только если включено (у тебя F1 — скилл, поэтому по умолчанию выключено)
+        if keys.get("use_next_target", False):
+            self.press(str(keys.get("target", "f1")))
+            time.sleep(0.12)
+            if self.vision.target_hp() > self.empty:
+                self.press(attack)
+                return True
 
-        mobs = self.vision.find_mobs()
+        img, found = self.vision.find_mobs_info()
+        mobs = [m for m in found if not self._is_blacklisted(m["sx"], m["sy"])]
         if not mobs:
+            if not found:
+                self._report_no_mobs(img)
             return False
 
-        for mx, my in mobs[:4]:
+        confirm_sec = float(timing.get("target_confirm", 0.9))
+        for m in mobs[:4]:
             self.checkpoint()
-            log(f"🎯 Навожу курсор на моба ({mx}, {my}), кликаю ЛКМ и жму F2...")
+            mx, my = m["sx"], m["sy"]
+            log(f"🎯 Моб найден: навожу курсор ({mx}, {my}), ЛКМ, затем {attack.upper()}")
             self.click_screen(mx, my)
-            # Сразу нажимаем боевой скилл F2 по цели!
-            self.press("f2")
-            time.sleep(0.15)
-            if self.vision.target_hp() > self.empty:
-                log(f"✓ Моб взят в таргет! (HP цели: {self.vision.target_hp():.0f}%)")
+            self.wait(float(timing.get("after_click", 0.25)))   # сервер должен принять выбор цели
+            self.press(attack)
+
+            deadline = time.time() + confirm_sec
+            while time.time() < deadline:
+                if self.vision.target_hp() > self.empty:
+                    log(f"✓ Моб взят в таргет! (HP цели: {self.vision.target_hp():.0f}%)")
+                    return True
+                self.wait(0.08)
+
+            if mcfg.get("assume_target_after_click", False):
+                log("➡ Полоса HP цели не подтвердилась, но assume_target_after_click=true — бью дальше.")
                 return True
+            log("✗ После клика цель не взята (полоса HP цели не появилась). "
+                "Проверь target_bar (python bot.py --diagnose) — пробую другого моба.")
+            self._blacklist_add(mx, my)
 
         return False
 
@@ -1095,8 +1218,9 @@ class Bot:
                     last_drop = time.time()
                 last_hp = hp
 
-                if time.time() - last_drop > t.get("no_damage_timeout", 10):
-                    log("⚠️ Урон по мобу не проходит 10 сек — сбрасываю цель")
+                no_dmg_limit = float(t.get("no_damage_timeout", 15))
+                if time.time() - last_drop > no_dmg_limit:
+                    log(f"⚠️ Урон по мобу не проходит {int(no_dmg_limit)} сек — сбрасываю цель")
                     return "stuck"
                 if time.time() - start > t.get("fight_timeout", 60):
                     log("⚠️ Бой длится более 60 сек — сбрасываю цель")
@@ -1256,7 +1380,73 @@ class Bot:
                 self.handle_death()
 
 
+def diagnose() -> None:
+    """python bot.py --diagnose — один снимок окна игры: что бот видит (мобы, полосы HP) + картинки для проверки."""
+    cfg = load_config()
+    v = Vision(cfg)
+    hwnd = find_game_window()
+    print("=" * 70)
+    print(" ДИАГНОСТИКА (запускай при открытой игре; мобы должны быть в кадре)")
+    print("=" * 70)
+    print(f" Права Администратора: {'да' if is_admin() else 'НЕТ — клавиши/клики в игру могут не доходить!'}")
+    if hwnd:
+        buf = ctypes.create_unicode_buffer(256)
+        ctypes.windll.user32.GetWindowTextW(hwnd, buf, 256)
+        print(f" Окно игры: найдено (HWND {hwnd}, «{buf.value}»)")
+    else:
+        print(" Окно игры: НЕ найдено — беру весь основной монитор. Заголовок окна должен содержать ketrawars / Lineage II.")
+    l, t, w, h = v.get_client_rect()
+    print(f" Клиентская область: x={l} y={t} размер {w}x{h}")
+    if h < 600:
+        print(" ⚠ Окно очень маленькое — проверь, что игра в оконном режиме / без рамки и не свёрнута.")
+
+    img, mobs = v.find_mobs_info()
+    cv2.imwrite("screen.png", img)
+    cv2.imwrite("debug_mobs.png", mobfinder.draw_debug(img, cfg, mobs))
+    print(f"\n Найдено мобов: {len(mobs)}")
+    for i, m in enumerate(mobs, 1):
+        print(f"   {i}) клик в экранную точку ({m['sx']}, {m['sy']}), надпись {m['box']}, пикселей {m['pixels']}")
+    if not mobs:
+        print("   Ничего не найдено. Открой debug_mobs.png: ЖЁЛТОЕ — пиксели, совпавшие по цвету.")
+        print("   • жёлтого на надписях нет  -> цвет другой: python calibrate.py mob (наведи курсор на «Lvl» и нажми F9)")
+        print("   • жёлтое есть, зелёной рамки нет -> режут размеры/зоны: правь секцию mobs в config.yaml")
+
+    thp, php = v.target_hp(), v.player_hp()
+    print(f"\n HP цели (target_bar): {thp:.0f}%   | HP персонажа (player_bar): {php:.0f}%")
+    print("   Выдели моба вручную: HP цели должно стать ~100%, иначе подправь target_bar (python calibrate.py).")
+    t_roi = v.grab()
+    if t_roi is not None and t_roi.size > 0:
+        cv2.imwrite("roi_debug.png", cv2.resize(t_roi, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST))
+    p_roi = v.grab_player()
+    if p_roi is not None and p_roi.size > 0:
+        cv2.imwrite("roi_player_debug.png", cv2.resize(p_roi, None, fx=4, fy=4, interpolation=cv2.INTER_NEAREST))
+    print("\n Файлы: screen.png (кадр), debug_mobs.png (разметка), roi_debug.png / roi_player_debug.png (полосы HP)")
+
+
+def test_keys() -> None:
+    """python bot.py --test-keys — через 5 сек фокусирует игру и один раз жмёт F2, показывает, дошла ли клавиша."""
+    key = str((load_config().get("keys") or {}).get("attack", "f2"))
+    print(f"Через 5 секунд активирую окно игры и нажму {key.upper()} (выдели моба/смотри на панель скиллов)...")
+    time.sleep(5)
+    hwnd = focus_game_window(wait_render=0.5)
+    fg = ctypes.windll.user32.GetForegroundWindow()
+    print(f"Окно игры: {hwnd}; на переднем плане: {fg}; админ: {is_admin()}")
+    if not hwnd or fg != hwnd:
+        print("⚠ Окно игры не на переднем плане — клавиша уйдёт не туда.")
+    l2_key_down(key, hwnd)
+    time.sleep(0.08)
+    l2_key_up(key, hwnd)
+    print(f"{key.upper()} отправлена. Если скилл не сработал — запусти консоль/бота от Администратора "
+          f"и убедись, что игра в оконном режиме или «без рамки».")
+
+
 def main():
+    if "--diagnose" in sys.argv:
+        diagnose()
+        return
+    if "--test-keys" in sys.argv:
+        test_keys()
+        return
     # Отправляем сигнал остановки (ctrl+alt+q) всем старым запущенным копиям бота,
     # прежде чем регистрировать собственные горячие клавиши
     if "--elevated" not in sys.argv:

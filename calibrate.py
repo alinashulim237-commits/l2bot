@@ -10,6 +10,9 @@
   python calibrate.py player   — читает область player_bar из config.yaml и показывает
                                  процент HP персонажа в реальном времени (+ сохраняет roi_player_debug.png).
   python calibrate.py shot     — сохраняет полный скриншот экрана в screen.png.
+  python calibrate.py mob      — подбор цвета надписи «Lvl:XX» над мобом: наведи курсор на букву надписи
+                                 и нажми F9 (добавить цвет) или F10 (сбросить на значения по умолчанию).
+                                 Результат пишется в calibration.yaml, config.yaml не трогается.
 """
 import ctypes
 import ctypes.wintypes as wt
@@ -22,6 +25,9 @@ import keyboard
 import mss
 import numpy as np
 
+import yaml
+
+import mobfinder
 from bot import Vision, load_config
 
 try:
@@ -80,9 +86,10 @@ def live_cursor():
             return
         x1, y1 = pts["target_left"]
         x2, y2 = cursor_pos()
-        x = min(x1, x2)
+        ox, oy = Vision(load_config()).get_origin()   # в конфиг — смещение от клиентской области окна игры
+        x = max(0, min(x1, x2) - ox)
         w = max(10, abs(x2 - x1))
-        y = max(0, int((y1 + y2) / 2) - 3)
+        y = max(0, int((y1 + y2) / 2) - 3 - oy)
         _update_yaml_bar("target_bar", x, y, w, 6)
         cfg = load_config()
         v = Vision(cfg)
@@ -99,9 +106,10 @@ def live_cursor():
             return
         x1, y1 = pts["player_left"]
         x2, y2 = cursor_pos()
-        x = min(x1, x2)
+        ox, oy = Vision(load_config()).get_origin()
+        x = max(0, min(x1, x2) - ox)
         w = max(10, abs(x2 - x1))
-        y = max(0, int((y1 + y2) / 2) - 3)
+        y = max(0, int((y1 + y2) / 2) - 3 - oy)
         _update_yaml_bar("player_bar", x, y, w, 6)
         cfg = load_config()
         v = Vision(cfg)
@@ -155,6 +163,66 @@ def live_player():
         time.sleep(0.2)
 
 
+CAL_PATH = "calibration.yaml"
+
+
+def _load_cal() -> dict:
+    try:
+        with open(CAL_PATH, encoding="utf-8") as f:
+            return yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {}
+
+
+def mob_color():
+    """Автоподбор цвета надписи Lvl:XX: курсор на букву надписи -> F9."""
+    print("======================================================================")
+    print(" ПОДБОР ЦВЕТА НАДПИСИ МОБА (Ctrl+C — выход)")
+    print("  1) Найди в игре моба, чтобы над ним была надпись Lvl:XX")
+    print("  2) Наведи курсор на саму букву/цифру надписи Lvl:XX и нажми [F9]")
+    print("     (можно повторить для мобов другого цвета — цвета добавляются)")
+    print("  [F10] — сбросить цвета на значения по умолчанию")
+    print("======================================================================\n")
+
+    def on_f9():
+        x, y = cursor_pos()
+        cfg = load_config()
+        v = Vision(cfg)
+        l, t, w, h = v.get_client_rect()
+        img = v._grab({"left": l, "top": t, "width": w, "height": h})
+        col = mobfinder.sample_color(img, x - l, y - t)
+        if col is None:
+            print("\n[F9] Рядом с курсором нет яркого цветного текста. Наведи точнее на букву надписи.")
+            return
+        cal = _load_cal()
+        colors = (cal.setdefault("mobs", {}).setdefault("colors", []))
+        colors.append(col)
+        with open(CAL_PATH, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cal, f, allow_unicode=True, sort_keys=False)
+        cfg = load_config()
+        mobs = mobfinder.find_mobs(img, cfg)
+        cv2.imwrite("debug_mobs.png", mobfinder.draw_debug(img, cfg, mobs))
+        print(f"\n✅ [F9] Добавил цвет BGR {col['low']}..{col['high']} в {CAL_PATH}. "
+              f"Теперь найдено мобов на экране: {len(mobs)} (см. debug_mobs.png)")
+
+    def on_f10():
+        cal = _load_cal()
+        if "mobs" in cal and "colors" in cal["mobs"]:
+            del cal["mobs"]["colors"]
+            if not cal["mobs"]:
+                del cal["mobs"]
+        with open(CAL_PATH, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cal, f, allow_unicode=True, sort_keys=False)
+        print("\n♻ [F10] Цвета сброшены на значения из config.yaml.")
+
+    keyboard.add_hotkey("f9", on_f9)
+    keyboard.add_hotkey("f10", on_f10)
+    while True:
+        x, y = cursor_pos()
+        print(f"\rx={x:<5} y={y:<5}   ", end="", flush=True)
+        time.sleep(0.2)
+
+
 def save_shot():
     cfg = load_config()
     vision = Vision(cfg)
@@ -172,6 +240,8 @@ if __name__ == "__main__":
             live_player()
         elif mode == "shot":
             save_shot()
+        elif mode == "mob":
+            mob_color()
         else:
             live_cursor()
     except KeyboardInterrupt:
