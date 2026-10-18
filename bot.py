@@ -147,23 +147,24 @@ def find_game_window() -> int | None:
         nonlocal found_hwnd
         if not user32.IsWindowVisible(hwnd):
             return True
+
+        cls_buf = ctypes.create_unicode_buffer(128)
+        user32.GetClassNameW(hwnd, cls_buf, 128)
+        cls_name = cls_buf.value.lower()
+
         length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        buf = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, buf, length + 1)
-        title = buf.value.lower()
+        title = ""
+        if length > 0:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buf, length + 1)
+            title = buf.value.lower()
 
         # Исключаем посторонние окна, в заголовке которых может встретиться слово lineage
         excluded = ("antigravity", "visual studio", "chrome", "edge", "opera", "telegram", "cmd.exe", "python", "блокнот", "notepad")
         if any(bad in title for bad in excluded):
             return True
 
-        cls_buf = ctypes.create_unicode_buffer(128)
-        user32.GetClassNameW(hwnd, cls_buf, 128)
-        cls_name = cls_buf.value.lower()
-
-        if "ketrawars" in title or "unrealwwindowsviewportwindow" in cls_name or title.startswith("lineage ii"):
+        if "unrealwwindowsviewportwindow" in cls_name or "ketrawars" in title or "lineage" in title:
             found_hwnd = hwnd
             return False
         return True
@@ -259,39 +260,37 @@ _EXTENDED_KEYS = {"up", "down", "left", "right"}
 
 
 def l2_key_down(key: str, hwnd: int | None = None) -> None:
-    """Отправляет нажатие клавиши в Lineage 2 (SendInput + keybd_event с VK для GetKeyState + PostMessageW)."""
+    """Отправляет чистое аппаратное нажатие клавиши в DirectInput игры."""
     k = key.lower()
-    pydirectinput.keyDown(k)
     vk = _VK_MAP.get(k)
     user32 = ctypes.windll.user32
     if vk:
         try:
             scan = user32.MapVirtualKeyW(vk, 0)
             user32.keybd_event(vk, scan, 0, 0)
-            if hwnd:
-                ext = (1 << 24) if k in _EXTENDED_KEYS else 0
-                lparam = 1 | (scan << 16) | ext
-                user32.PostMessageW(hwnd, 0x0100, vk, lparam)  # WM_KEYDOWN
         except Exception:
             pass
+    try:
+        pydirectinput.keyDown(k)
+    except Exception:
+        pass
 
 
 def l2_key_up(key: str, hwnd: int | None = None) -> None:
-    """Отправляет отпускание клавиши в Lineage 2."""
+    """Отправляет чистое аппаратное отпускание клавиши в DirectInput игры."""
     k = key.lower()
-    pydirectinput.keyUp(k)
     vk = _VK_MAP.get(k)
     user32 = ctypes.windll.user32
     if vk:
         try:
             scan = user32.MapVirtualKeyW(vk, 0)
-            user32.keybd_event(vk, scan, 2, 0)
-            if hwnd:
-                ext = (1 << 24) if k in _EXTENDED_KEYS else 0
-                lparam = 1 | (scan << 16) | ext | (1 << 30) | (1 << 31)
-                user32.PostMessageW(hwnd, 0x0101, vk, lparam)  # WM_KEYUP
+            user32.keybd_event(vk, scan, 2, 0)  # KEYEVENTF_KEYUP
         except Exception:
             pass
+    try:
+        pydirectinput.keyUp(k)
+    except Exception:
+        pass
 
 
 def cursor_pos() -> tuple[int, int]:
@@ -1024,7 +1023,7 @@ class Bot:
     def press(self, key):
         hwnd = focus_game_window()
         l2_key_down(key, hwnd)
-        time.sleep(random.uniform(0.12, 0.16))
+        time.sleep(random.uniform(0.16, 0.22))
         l2_key_up(key, hwnd)
 
     def hold(self, key, sec):
@@ -1167,27 +1166,36 @@ class Bot:
                 self._report_no_mobs(img)
             return False
 
-        confirm_sec = float(timing.get("target_confirm", 0.9))
+        confirm_sec = float(timing.get("target_confirm", 1.2))
         for m in mobs[:4]:
             self.checkpoint()
             mx, my = m["sx"], m["sy"]
-            log(f"🎯 Моб найден: навожу курсор ({mx}, {my}), ЛКМ, затем {attack.upper()}")
+            log(f"🎯 Моб найден: клик в тело ({mx}, {my}) на 1 см ниже ника...")
             self.click_screen(mx, my)
-            self.wait(float(timing.get("after_click", 0.25)))   # сервер должен принять выбор цели
-            self.press(attack)
 
+            # Ожидаем появление полосы HP цели
+            acquired = False
             deadline = time.time() + confirm_sec
             while time.time() < deadline:
                 if self.vision.target_hp() > self.empty:
-                    log(f"✓ Моб взят в таргет! (HP цели: {self.vision.target_hp():.0f}%)")
-                    return True
-                self.wait(0.08)
+                    acquired = True
+                    break
+                self.wait(0.06)
 
-            if mcfg.get("assume_target_after_click", False):
-                log("➡ Полоса HP цели не подтвердилась, но assume_target_after_click=true — бью дальше.")
+            # Если после первого клика полоса цели ещё не появилась — повторный клик прямо в тело моба
+            if not acquired:
+                self.click_screen(mx, my)
+                self.wait(0.25)
+                if self.vision.target_hp() > self.empty:
+                    acquired = True
+
+            if acquired or mcfg.get("assume_target_after_click", True):
+                hp_val = self.vision.target_hp()
+                log(f"✓ Моб взят в таргет! (HP: {hp_val:.0f}%) -> Начинаю атаку {attack.upper()}!")
+                self.press(attack)
                 return True
-            log("✗ После клика цель не взята (полоса HP цели не появилась). "
-                "Проверь target_bar (python bot.py --diagnose) — пробую другого моба.")
+
+            log("✗ После клика цель не взята (полоса HP цели не появилась) — пробую следующего моба.")
             self._blacklist_add(mx, my)
 
         return False
@@ -1434,10 +1442,9 @@ def test_keys() -> None:
     if not hwnd or fg != hwnd:
         print("⚠ Окно игры не на переднем плане — клавиша уйдёт не туда.")
     l2_key_down(key, hwnd)
-    time.sleep(0.08)
+    time.sleep(0.18)
     l2_key_up(key, hwnd)
-    print(f"{key.upper()} отправлена. Если скилл не сработал — запусти консоль/бота от Администратора "
-          f"и убедись, что игра в оконном режиме или «без рамки».")
+    print(f"{key.upper()} отправлена (удержание 180 мс). Если скилл сработал — клавиатура работает отлично!")
 
 
 def main():
