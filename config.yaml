@@ -1,0 +1,79 @@
+# ============ L2 Interlude farm bot — настройки ============
+
+keys:
+  target: f1                   # клавиша «следующая цель» (макрос /targetnext на панели F1)
+  toggle: ctrl+alt+s           # старт / пауза (бот стартует на паузе!)
+  stop: ctrl+alt+q             # полная остановка
+  simulate_death: ctrl+alt+d   # симуляция смерти / воскрешения (для проверки без реальной смерти)
+
+# Ротация за один цикл боя: F2 и F1 пока моб не умрет
+# delay — пауза после нажатия (сек): время каста + откат скилла.
+rotation:
+  - {key: f2, delay: 0.75}
+  - {key: f1, delay: 0.65}
+
+timing:
+  after_target: [0.15, 0.25]   # пауза после клика по мобу
+  after_kill: [0.35, 0.6]      # пауза после убийства моба
+  no_damage_timeout: 10        # HP цели не падает столько секунд -> сбрасываем цель
+  fight_timeout: 60            # максимум секунд на одного моба
+
+move:                          # поворот и поиск новых мобов
+  forward_key: up
+  turn_keys: [left, right]
+  forward_time: [0.6, 1.4]     # сколько секунд бежать вперёд при застревании
+  turn_time: [0.2, 0.5]        # сколько секунд поворачиваться
+  lost_turn_multiplier: 2.5    # после 3 неудачных поисков подряд поворот больше
+
+# Область полосы HP ЦЕЛИ в пикселях (базовое смещение от клиентской области).
+target_bar:
+  x: 571
+  y: 66
+  w: 146
+  h: 3
+
+# Цвет заполненной полосы HP цели (красный) в HSV OpenCV (H 0-179).
+bar_color:
+  - [[0, 120, 70], [10, 255, 255]]
+  - [[170, 120, 70], [179, 255, 255]]
+
+empty_threshold: 1.0           # HP цели <= этого % — моб мёртв / цели нет
+
+# Полоса HP ПЕРСОНАЖА в пикселях (базовое смещение от клиентской области).
+player_bar:
+  x: 16
+  y: 51
+  w: 150
+  h: 2
+
+# Цвет заполненной полосы HP персонажа (HSV OpenCV, H 0-179).
+player_bar_color:
+  - [[0, 120, 70], [10, 255, 255]]
+  - [[170, 120, 70], [179, 255, 255]]
+
+death:
+  enabled: true
+  check_interval: 0.5        # сек между реальными чтениями экрана
+  confirm_reads: 3           # столько проверок подряд HP <= empty_threshold = смерть
+  empty_threshold: 1.0       # % HP персонажа, ниже/равно — «пусто»
+  alive_threshold: 10.0      # % HP, выше — «жив»
+  revive_confirm_sec: 3      # сколько секунд HP должен быть > alive_threshold, чтобы считать воскрешение
+  auto_resume: false         # после воскрешения продолжать работу автоматически
+  use_template: false        # опционально, Шаг 8a (поиск кнопки «В деревню»)
+  template_path: templates/revive.png
+  template_threshold: 0.8
+  template_roi: null         # [x, y, w, h] или null = весь экран
+
+telegram:
+  enabled: true
+  send_screenshot: true      # прикладывать скриншот к уведомлению о смерти
+  timeout_sec: 10
+  retries: 3
+  repeat_every_sec: 60       # напоминание, пока персонаж мёртв
+  max_repeats: 10
+  notify_on_start: false     # Шаг 8c: уведомление при первом запуске из паузы
+  notify_on_stop: false      # Шаг 8c: уведомление при завершении работы
+
+stall_alert:                 # Шаг 8b: алерт «нет убийств N минут»
+  enabled: false
+  minutes: 10
